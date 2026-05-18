@@ -178,18 +178,18 @@
       <div class="api-setup-header">
         <span class="api-setup-title" id="apiSetupTitle">Connect data source</span>
         <span class="api-connected" id="apiConnected" style="display:none">
-          <span class="dot"></span> FMP connected
+          <span class="dot"></span> Alpha Vantage connected
           <button class="btn-clear" onclick="clearApiKey()">change</button>
         </span>
       </div>
       <div id="apiKeyForm">
         <div class="api-key-row">
-          <input type="text" id="apiKeyInput" placeholder="Paste your free FMP API key" autocomplete="off">
+          <input type="text" id="apiKeyInput" placeholder="Paste your free Alpha Vantage key" autocomplete="off">
           <button class="btn-save" onclick="saveApiKey()">Save</button>
         </div>
         <p class="api-hint">
-          Free key at <a href="https://financialmodelingprep.com/register" target="_blank">financialmodelingprep.com/register</a>
-          — 250 requests/day, no credit card.
+          Free key at <a href="https://www.alphavantage.co/support/#api-key" target="_blank">alphavantage.co</a>
+          — instant, no credit card, 25 requests/day.
         </p>
       </div>
     </div>
@@ -311,9 +311,9 @@
         <div class="icon">🔑</div>
         <div class="title">Add your free API key to get started</div>
         <div class="sub">
-          Get a free key at <a href="https://financialmodelingprep.com/register" target="_blank" style="color:var(--accent)">financialmodelingprep.com/register</a><br>
-          then paste it in the box on the left.<br><br>
-          Or skip it and enter values manually.
+          Get a free key at <a href="https://www.alphavantage.co/support/#api-key" target="_blank" style="color:var(--accent)">alphavantage.co</a>
+          — instant, no credit card.<br>
+          Paste it in the box on the left, then type any ticker.
         </div>
       </div>
     </div>
@@ -587,7 +587,7 @@ function applyKeyUI(key) {
     // Update main panel hint if still showing the key prompt
     const mc = document.getElementById('mainContent');
     if (mc.querySelector('.no-solution .icon')?.textContent === '🔑') {
-      mc.innerHTML = `<div class="no-solution"><div class="icon">📊</div><div class="title">Enter a ticker to get started</div><div class="sub">Type any NYSE or NASDAQ symbol above.</div></div>`;
+      mc.innerHTML = `<div class="no-solution"><div class="icon">📊</div><div class="title">Enter a ticker to get started</div><div class="sub">Type any NYSE or NASDAQ symbol in the box on the left.</div></div>`;
     }
   } else {
     form.style.display      = '';
@@ -597,72 +597,82 @@ function applyKeyUI(key) {
   }
 }
 
-// ─── FMP DATA FETCH ───────────────────────────────────────────────────────
+// ─── ALPHA VANTAGE DATA FETCH ─────────────────────────────────────────────
 
-const FMP = 'https://financialmodelingprep.com/api/v3';
+const AV = 'https://www.alphavantage.co/query';
 
-async function fmpGet(path, apiKey) {
-  const sep = path.includes('?') ? '&' : '?';
-  const res = await fetch(`${FMP}${path}${sep}apikey=${apiKey}`, { signal: AbortSignal.timeout(10000) });
-  if (res.status === 403) throw new Error('403');
-  if (res.status === 401) throw new Error('401');
+async function avGet(func, symbol, apiKey) {
+  const url = `${AV}?function=${func}&symbol=${symbol}&apikey=${apiKey}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  // FMP returns {"Error Message":"..."} on bad key / plan limit
-  if (data?.['Error Message']) throw new Error(data['Error Message']);
+  if (data?.Note)        throw new Error('Rate limit reached — Alpha Vantage free tier allows 25 requests/day. Try again later.');
+  if (data?.Information) throw new Error('Rate limit reached — Alpha Vantage free tier allows 25 requests/day. Try again later.');
+  if (data?.['Error Message']) throw new Error(`Invalid ticker or API error: ${data['Error Message']}`);
   return data;
 }
 
-// Fetch with graceful fallback — returns null instead of throwing
-async function fmpSafe(path, apiKey) {
-  try { return await fmpGet(path, apiKey); } catch { return null; }
+async function avSafe(func, symbol, apiKey) {
+  try { return await avGet(func, symbol, apiKey); } catch { return null; }
 }
 
 async function loadTicker(ticker, apiKey) {
-  // Profile is required; financial statements are best-effort (may be paywalled)
-  const [profile, cfAnnual, bsAnnual] = await Promise.all([
-    fmpGet(`/profile/${ticker}`, apiKey),                                         // always free
-    fmpSafe(`/cash-flow-statement/${ticker}?period=annual&limit=1`, apiKey),      // free on most plans
-    fmpSafe(`/balance-sheet-statement/${ticker}?period=annual&limit=1`, apiKey),  // free on most plans
+  // 3 parallel calls: overview (company info + shares), cash flow, balance sheet
+  const [overview, cashFlow, balanceSheet] = await Promise.all([
+    avGet('OVERVIEW',       ticker, apiKey),
+    avSafe('CASH_FLOW',     ticker, apiKey),
+    avSafe('BALANCE_SHEET', ticker, apiKey),
   ]);
 
-  if (!Array.isArray(profile) || profile.length === 0) {
-    if (profile === null) throw new Error('Invalid API key or plan limit reached. Check your key at financialmodelingprep.com.');
-    throw new Error(`Ticker "${ticker}" not found. Check the symbol and try again.`);
+  if (!overview?.Symbol) {
+    throw new Error(`"${ticker}" not found. Check the symbol or verify your API key at alphavantage.co.`);
   }
 
-  const p  = profile[0];
-  const cf = Array.isArray(cfAnnual) ? cfAnnual[0] : null;
-  const bs = Array.isArray(bsAnnual) ? bsAnnual[0] : null;
+  // Price: derive from market cap / shares (Alpha Vantage overview is updated daily)
+  const mktCapRaw = parseFloat(overview.MarketCapitalization);
+  const sharesRaw = parseFloat(overview.SharesOutstanding);
+  const stockPrice = (mktCapRaw > 0 && sharesRaw > 0) ? mktCapRaw / sharesRaw : null;
+  const shares     = sharesRaw > 0 ? sharesRaw / 1e6 : null;
+  const mktCap     = mktCapRaw > 0 ? mktCapRaw / 1e6 : null;
 
-  // FCF from most recent annual report
-  let fcfAnnualVal = null;
-  if (cf) {
-    fcfAnnualVal = cf.freeCashFlow
-      ?? (cf.operatingCashFlow != null && cf.capitalExpenditure != null
-          ? cf.operatingCashFlow + cf.capitalExpenditure   // capEx is negative in FMP
-          : null);
+  // TTM FCF: sum last 4 quarterly reports, fall back to most recent annual
+  let fcf = null;
+  const qReports = cashFlow?.quarterlyReports;
+  const aReports = cashFlow?.annualReports;
+  if (Array.isArray(qReports) && qReports.length >= 4) {
+    const sum = qReports.slice(0, 4).reduce((acc, q) => {
+      const op  = parseFloat(q.operatingCashflow    || 0);
+      const cap = parseFloat(q.capitalExpenditures  || 0);
+      return acc + (op - cap);
+    }, 0);
+    if (!isNaN(sum)) fcf = sum / 1e6;
+  } else if (Array.isArray(aReports) && aReports.length > 0) {
+    const r   = aReports[0];
+    const op  = parseFloat(r.operatingCashflow   || 0);
+    const cap = parseFloat(r.capitalExpenditures || 0);
+    if (!isNaN(op) && !isNaN(cap)) fcf = (op - cap) / 1e6;
   }
 
-  const totalDebt = bs?.totalDebt ?? bs?.longTermDebt ?? null;
-  const cash      = bs?.cashAndCashEquivalents ?? bs?.cashAndShortTermInvestments ?? null;
-  const netDebt   = (totalDebt != null && cash != null) ? totalDebt - cash : null;
-
-  // Shares: prefer profile field, fall back to mktCap / price
-  const shares = p.sharesOutstanding != null
-    ? p.sharesOutstanding / 1e6
-    : (p.mktCap && p.price ? p.mktCap / p.price / 1e6 : null);
+  // Net debt from most recent annual balance sheet
+  let netDebt = null;
+  const bs = balanceSheet?.annualReports?.[0];
+  if (bs) {
+    const ltd   = parseFloat(bs.longTermDebt  || bs.longTermDebtNoncurrent || 0);
+    const std   = parseFloat(bs.shortTermDebt || bs.currentDebt            || 0);
+    const cash  = parseFloat(bs.cashAndCashEquivalentsAtCarryingValue || bs.cashAndShortTermInvestments || 0);
+    if (!isNaN(ltd + std - cash)) netDebt = (ltd + std - cash) / 1e6;
+  }
 
   return {
-    companyName: p.companyName,
-    exchange:    p.exchangeShortName || p.exchange,
-    sector:      p.sector,
-    stockPrice:  p.price,
+    companyName:   overview.Name,
+    exchange:      overview.Exchange,
+    sector:        overview.Sector !== 'None' ? overview.Sector : '',
+    stockPrice,
     shares,
-    netDebt:     netDebt != null ? netDebt / 1e6 : null,
-    fcf:         fcfAnnualVal != null ? fcfAnnualVal / 1e6 : null,
-    mktCap:      p.mktCap != null ? p.mktCap / 1e6 : null,
-    hasFinancials: cf != null || bs != null,
+    mktCap,
+    netDebt,
+    fcf,
+    hasFinancials: cashFlow != null || balanceSheet != null,
   };
 }
 
@@ -708,7 +718,7 @@ function populateFromData(data, ticker) {
   document.getElementById('cdNetDebt').textContent   = data.netDebt    != null ? fmt$(data.netDebt)               : 'N/A';
 
   document.getElementById('dataTimestamp').textContent =
-    `FMP · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} · annual statements`;
+    `Alpha Vantage · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} · annual statements`;
 
   document.getElementById('companyCard').classList.add('visible');
 
