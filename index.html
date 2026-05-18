@@ -604,40 +604,51 @@ const FMP = 'https://financialmodelingprep.com/api/v3';
 async function fmpGet(path, apiKey) {
   const sep = path.includes('?') ? '&' : '?';
   const res = await fetch(`${FMP}${path}${sep}apikey=${apiKey}`, { signal: AbortSignal.timeout(10000) });
-  if (!res.ok) throw new Error(`FMP API returned ${res.status}`);
-  return res.json();
+  if (res.status === 403) throw new Error('403');
+  if (res.status === 401) throw new Error('401');
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  // FMP returns {"Error Message":"..."} on bad key / plan limit
+  if (data?.['Error Message']) throw new Error(data['Error Message']);
+  return data;
+}
+
+// Fetch with graceful fallback — returns null instead of throwing
+async function fmpSafe(path, apiKey) {
+  try { return await fmpGet(path, apiKey); } catch { return null; }
 }
 
 async function loadTicker(ticker, apiKey) {
-  // Three parallel requests: profile, last-4-quarter cash flows, latest balance sheet
-  const [profile, cfQuarterly, bsQuarterly] = await Promise.all([
-    fmpGet(`/profile/${ticker}`, apiKey),
-    fmpGet(`/cash-flow-statement/${ticker}?period=quarter&limit=4`, apiKey),
-    fmpGet(`/balance-sheet-statement/${ticker}?period=quarter&limit=1`, apiKey),
+  // Profile is required; financial statements are best-effort (may be paywalled)
+  const [profile, cfAnnual, bsAnnual] = await Promise.all([
+    fmpGet(`/profile/${ticker}`, apiKey),                                         // always free
+    fmpSafe(`/cash-flow-statement/${ticker}?period=annual&limit=1`, apiKey),      // free on most plans
+    fmpSafe(`/balance-sheet-statement/${ticker}?period=annual&limit=1`, apiKey),  // free on most plans
   ]);
 
-  if (!Array.isArray(profile) || profile.length === 0)
+  if (!Array.isArray(profile) || profile.length === 0) {
+    if (profile === null) throw new Error('Invalid API key or plan limit reached. Check your key at financialmodelingprep.com.');
     throw new Error(`Ticker "${ticker}" not found. Check the symbol and try again.`);
-
-  const p  = profile[0];
-  const bs = bsQuarterly?.[0] || {};
-
-  // TTM FCF = sum of last 4 quarters' freeCashFlow
-  let fcfTTM = null;
-  if (Array.isArray(cfQuarterly) && cfQuarterly.length > 0) {
-    const quarters = cfQuarterly.slice(0, 4);
-    const sum = quarters.reduce((acc, q) => {
-      const v = q.freeCashFlow ?? (q.operatingCashFlow + q.capitalExpenditure);
-      return acc + (v || 0);
-    }, 0);
-    if (quarters.length > 0) fcfTTM = sum;
   }
 
-  const totalDebt = bs.totalDebt ?? bs.longTermDebt ?? 0;
-  const cash      = bs.cashAndCashEquivalents ?? bs.cashAndShortTermInvestments ?? 0;
-  const netDebt   = totalDebt - cash;
+  const p  = profile[0];
+  const cf = Array.isArray(cfAnnual) ? cfAnnual[0] : null;
+  const bs = Array.isArray(bsAnnual) ? bsAnnual[0] : null;
 
-  // Shares: prefer sharesOutstanding, fall back to mktCap / price
+  // FCF from most recent annual report
+  let fcfAnnualVal = null;
+  if (cf) {
+    fcfAnnualVal = cf.freeCashFlow
+      ?? (cf.operatingCashFlow != null && cf.capitalExpenditure != null
+          ? cf.operatingCashFlow + cf.capitalExpenditure   // capEx is negative in FMP
+          : null);
+  }
+
+  const totalDebt = bs?.totalDebt ?? bs?.longTermDebt ?? null;
+  const cash      = bs?.cashAndCashEquivalents ?? bs?.cashAndShortTermInvestments ?? null;
+  const netDebt   = (totalDebt != null && cash != null) ? totalDebt - cash : null;
+
+  // Shares: prefer profile field, fall back to mktCap / price
   const shares = p.sharesOutstanding != null
     ? p.sharesOutstanding / 1e6
     : (p.mktCap && p.price ? p.mktCap / p.price / 1e6 : null);
@@ -648,11 +659,10 @@ async function loadTicker(ticker, apiKey) {
     sector:      p.sector,
     stockPrice:  p.price,
     shares,
-    netDebt:     netDebt / 1e6,
-    fcfTTM:      fcfTTM != null ? fcfTTM / 1e6 : null,
-    currency:    p.currency || 'USD',
-    mktCap:      p.mktCap / 1e6,
-    cfQuarters:  cfQuarterly?.length ?? 0,
+    netDebt:     netDebt != null ? netDebt / 1e6 : null,
+    fcf:         fcfAnnualVal != null ? fcfAnnualVal / 1e6 : null,
+    mktCap:      p.mktCap != null ? p.mktCap / 1e6 : null,
+    hasFinancials: cf != null || bs != null,
   };
 }
 
@@ -668,20 +678,21 @@ function populateFromData(data, ticker) {
 
   setField('stockPrice', data.stockPrice);
   setField('shares',     data.shares);
-  setField('netDebt',    data.netDebt);
+  if (data.netDebt != null) setField('netDebt', data.netDebt);
 
-  if (data.fcfTTM != null && data.fcfTTM > 0) {
-    setField('fcf', data.fcfTTM);
-    if (data.cfQuarters < 4) warnings.push(`Only ${data.cfQuarters} quarter(s) of cash flow data available — TTM FCF may be understated.`);
-  } else if (data.fcfTTM != null && data.fcfTTM <= 0) {
-    warnings.push(`TTM FCF is negative (${fmt$(data.fcfTTM)}). Enter a normalised FCF figure manually.`);
+  if (data.fcf != null && data.fcf > 0) {
+    setField('fcf', data.fcf);
+  } else if (data.fcf != null && data.fcf <= 0) {
+    warnings.push(`Most recent annual FCF is negative (${fmt$(data.fcf)}). Enter a normalised figure manually.`);
+  } else if (!data.hasFinancials) {
+    warnings.push('Financial statements not available on your FMP plan — enter FCF and net debt manually.');
   } else {
-    warnings.push('Free cash flow data unavailable — enter it manually.');
+    warnings.push('FCF data unavailable for this ticker — enter it manually.');
   }
 
   // Badges
   if (data.stockPrice || data.shares) document.getElementById('mktBadge').style.display = '';
-  if (data.fcfTTM > 0)                document.getElementById('finBadge').style.display = '';
+  if (data.fcf > 0)                   document.getElementById('finBadge').style.display = '';
 
   // Company card
   document.getElementById('companyName').textContent     = data.companyName || ticker;
@@ -691,11 +702,10 @@ function populateFromData(data, ticker) {
   if (data.sector) { sectorEl.textContent = data.sector; sectorEl.style.display = ''; }
   else sectorEl.style.display = 'none';
 
-  const mktCap = data.mktCap;
-  document.getElementById('cdPrice').textContent    = data.stockPrice != null ? `$${data.stockPrice.toFixed(2)}` : '—';
-  document.getElementById('cdMarketCap').textContent = mktCap != null ? fmt$(mktCap) : '—';
-  document.getElementById('cdFCF').textContent      = data.fcfTTM   != null ? fmt$(data.fcfTTM)  : 'N/A';
-  document.getElementById('cdNetDebt').textContent  = fmt$(data.netDebt);
+  document.getElementById('cdPrice').textContent     = data.stockPrice != null ? `$${data.stockPrice.toFixed(2)}` : '—';
+  document.getElementById('cdMarketCap').textContent = data.mktCap     != null ? fmt$(data.mktCap)               : '—';
+  document.getElementById('cdFCF').textContent       = data.fcf        != null ? fmt$(data.fcf)                   : 'N/A';
+  document.getElementById('cdNetDebt').textContent   = data.netDebt    != null ? fmt$(data.netDebt)               : 'N/A';
 
   document.getElementById('dataTimestamp').textContent =
     `FMP · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} · annual statements`;
