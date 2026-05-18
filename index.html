@@ -178,18 +178,18 @@
       <div class="api-setup-header">
         <span class="api-setup-title" id="apiSetupTitle">Connect data source</span>
         <span class="api-connected" id="apiConnected" style="display:none">
-          <span class="dot"></span> Alpha Vantage connected
+          <span class="dot"></span> Finnhub connected
           <button class="btn-clear" onclick="clearApiKey()">change</button>
         </span>
       </div>
       <div id="apiKeyForm">
         <div class="api-key-row">
-          <input type="text" id="apiKeyInput" placeholder="Paste your free Alpha Vantage key" autocomplete="off">
+          <input type="text" id="apiKeyInput" placeholder="Paste your free Finnhub API key" autocomplete="off">
           <button class="btn-save" onclick="saveApiKey()">Save</button>
         </div>
         <p class="api-hint">
-          Free key at <a href="https://www.alphavantage.co/support/#api-key" target="_blank">alphavantage.co</a>
-          — instant, no credit card, 25 requests/day.
+          Free key at <a href="https://finnhub.io/register" target="_blank">finnhub.io/register</a>
+          — instant, no credit card, 60 calls/min.
         </p>
       </div>
     </div>
@@ -311,7 +311,7 @@
         <div class="icon">🔑</div>
         <div class="title">Add your free API key to get started</div>
         <div class="sub">
-          Get a free key at <a href="https://www.alphavantage.co/support/#api-key" target="_blank" style="color:var(--accent)">alphavantage.co</a>
+          Get a free key at <a href="https://finnhub.io/register" target="_blank" style="color:var(--accent)">finnhub.io/register</a>
           — instant, no credit card.<br>
           Paste it in the box on the left, then type any ticker.
         </div>
@@ -597,82 +597,67 @@ function applyKeyUI(key) {
   }
 }
 
-// ─── ALPHA VANTAGE DATA FETCH ─────────────────────────────────────────────
+// ─── FINNHUB DATA FETCH ───────────────────────────────────────────────────
 
-const AV = 'https://www.alphavantage.co/query';
+const FH = 'https://finnhub.io/api/v1';
 
-async function avGet(func, symbol, apiKey) {
-  const url = `${AV}?function=${func}&symbol=${symbol}&apikey=${apiKey}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+async function fhGet(path, apiKey) {
+  const sep = path.includes('?') ? '&' : '?';
+  const res = await fetch(`${FH}${path}${sep}token=${apiKey}`, { signal: AbortSignal.timeout(12000) });
+  if (res.status === 401 || res.status === 403) throw new Error('Invalid API key — check your key at finnhub.io.');
+  if (res.status === 429) throw new Error('Rate limit reached — wait a moment and try again.');
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  if (data?.Note)        throw new Error('Rate limit reached — Alpha Vantage free tier allows 25 requests/day. Try again later.');
-  if (data?.Information) throw new Error('Rate limit reached — Alpha Vantage free tier allows 25 requests/day. Try again later.');
-  if (data?.['Error Message']) throw new Error(`Invalid ticker or API error: ${data['Error Message']}`);
+  if (data?.error) throw new Error(data.error);
   return data;
 }
 
-async function avSafe(func, symbol, apiKey) {
-  try { return await avGet(func, symbol, apiKey); } catch { return null; }
+async function fhSafe(path, apiKey) {
+  try { return await fhGet(path, apiKey); } catch { return null; }
 }
 
 async function loadTicker(ticker, apiKey) {
-  // 3 parallel calls: overview (company info + shares), cash flow, balance sheet
-  const [overview, cashFlow, balanceSheet] = await Promise.all([
-    avGet('OVERVIEW',       ticker, apiKey),
-    avSafe('CASH_FLOW',     ticker, apiKey),
-    avSafe('BALANCE_SHEET', ticker, apiKey),
+  // 3 parallel calls: real-time quote, company profile, and key metrics
+  const [quote, profile, metrics] = await Promise.all([
+    fhGet(`/quote?symbol=${ticker}`,                        apiKey),
+    fhGet(`/stock/profile2?symbol=${ticker}`,               apiKey),
+    fhSafe(`/stock/metric?symbol=${ticker}&metric=all`,     apiKey),
   ]);
 
-  if (!overview?.Symbol) {
-    throw new Error(`"${ticker}" not found. Check the symbol or verify your API key at alphavantage.co.`);
+  if (!profile?.name) {
+    throw new Error(`"${ticker}" not found. Check the symbol or verify your key at finnhub.io.`);
   }
 
-  // Price: derive from market cap / shares (Alpha Vantage overview is updated daily)
-  const mktCapRaw = parseFloat(overview.MarketCapitalization);
-  const sharesRaw = parseFloat(overview.SharesOutstanding);
-  const stockPrice = (mktCapRaw > 0 && sharesRaw > 0) ? mktCapRaw / sharesRaw : null;
-  const shares     = sharesRaw > 0 ? sharesRaw / 1e6 : null;
-  const mktCap     = mktCapRaw > 0 ? mktCapRaw / 1e6 : null;
+  const stockPrice = quote?.c   || null;                    // current price
+  const shares     = profile?.shareOutstanding  || null;    // already in millions
+  const mktCap     = profile?.marketCapitalization || null; // already in millions
+  const m          = metrics?.metric || {};
 
-  // TTM FCF: sum last 4 quarterly reports, fall back to most recent annual
-  let fcf = null;
-  const qReports = cashFlow?.quarterlyReports;
-  const aReports = cashFlow?.annualReports;
-  if (Array.isArray(qReports) && qReports.length >= 4) {
-    const sum = qReports.slice(0, 4).reduce((acc, q) => {
-      const op  = parseFloat(q.operatingCashflow    || 0);
-      const cap = parseFloat(q.capitalExpenditures  || 0);
-      return acc + (op - cap);
-    }, 0);
-    if (!isNaN(sum)) fcf = sum / 1e6;
-  } else if (Array.isArray(aReports) && aReports.length > 0) {
-    const r   = aReports[0];
-    const op  = parseFloat(r.operatingCashflow   || 0);
-    const cap = parseFloat(r.capitalExpenditures || 0);
-    if (!isNaN(op) && !isNaN(cap)) fcf = (op - cap) / 1e6;
+  // FCF: prefer TTM, fall back to annual series latest value
+  let fcf = m.freeCashFlowTTM ?? null;
+  if (fcf == null && Array.isArray(metrics?.series?.annual?.freeCashFlow)) {
+    const arr = metrics.series.annual.freeCashFlow;
+    fcf = arr.length > 0 ? arr[arr.length - 1].v : null;
   }
 
-  // Net debt from most recent annual balance sheet
-  let netDebt = null;
-  const bs = balanceSheet?.annualReports?.[0];
-  if (bs) {
-    const ltd   = parseFloat(bs.longTermDebt  || bs.longTermDebtNoncurrent || 0);
-    const std   = parseFloat(bs.shortTermDebt || bs.currentDebt            || 0);
-    const cash  = parseFloat(bs.cashAndCashEquivalentsAtCarryingValue || bs.cashAndShortTermInvestments || 0);
-    if (!isNaN(ltd + std - cash)) netDebt = (ltd + std - cash) / 1e6;
+  // Net debt: prefer annual metric, fall back to computing from components
+  let netDebt = m.netDebtAnnual ?? null;
+  if (netDebt == null) {
+    const totalDebt = m.totalDebtAnnual ?? m.longTermDebtAnnual ?? null;
+    const cash      = m.cashAnnual      ?? m.totalCashAnnual    ?? null;
+    if (totalDebt != null && cash != null) netDebt = totalDebt - cash;
   }
 
   return {
-    companyName:   overview.Name,
-    exchange:      overview.Exchange,
-    sector:        overview.Sector !== 'None' ? overview.Sector : '',
+    companyName:   profile.name,
+    exchange:      profile.exchange,
+    sector:        profile.finnhubIndustry || '',
     stockPrice,
     shares,
     mktCap,
-    netDebt,
-    fcf,
-    hasFinancials: cashFlow != null || balanceSheet != null,
+    netDebt,      // already in millions
+    fcf,          // already in millions
+    hasFinancials: metrics != null,
   };
 }
 
@@ -718,7 +703,7 @@ function populateFromData(data, ticker) {
   document.getElementById('cdNetDebt').textContent   = data.netDebt    != null ? fmt$(data.netDebt)               : 'N/A';
 
   document.getElementById('dataTimestamp').textContent =
-    `Alpha Vantage · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} · annual statements`;
+    `Finnhub · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} · real-time quote, TTM financials`;
 
   document.getElementById('companyCard').classList.add('visible');
 
